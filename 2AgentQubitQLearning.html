@@ -1,0 +1,397 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+<title>Two-Qubit Q-Learning to Entangle</title>
+<style>
+  :root{--bg:#0b1220;--fg:#e9edfa;--mut:#a9b5d9;--glass:rgba(255,255,255,0.07);--ok:#7ee787;--warn:#ff7b72;--gold:#ffd166;}
+  *{box-sizing:border-box; -webkit-tap-highlight-color:transparent}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--fg);font:14px/1.35 system-ui,-apple-system,Segoe UI,Roboto,Arial}
+  #app{display:flex;flex-direction:column;gap:10px;max-width:1000px;margin:0 auto;padding:12px}
+  header,section{background:var(--glass);border:1px solid #ffffff18;border-radius:12px;padding:12px;backdrop-filter:blur(6px)}
+  header{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between}
+  .row{display:flex;gap:12px;flex-wrap:wrap;align-items:center}
+  .col{display:flex;flex-direction:column;gap:6px}
+  button,.pill{border:1px solid #ffffff25;background:#ffffff10;color:var(--fg);border-radius:10px;padding:8px 12px;cursor:pointer}
+  button:hover{background:#ffffff16}
+  input[type=range]{width:160px}
+  .grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
+  .card{border:1px solid #ffffff18;border-radius:10px;padding:10px;background:#ffffff08}
+  canvas{width:100%;height:220px;background:#0c142a;border-radius:10px}
+  .mono{font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace}
+  .small{font-size:12px;color:var(--mut)}
+  .bar{height:10px;background:#ffffff20;border-radius:6px;overflow:hidden}
+  .bar>span{display:block;height:100%;background:linear-gradient(90deg,var(--ok),#5ea0ff)}
+  .qtable{display:grid;grid-template-columns:repeat(7,1fr);gap:4px}
+  .cell{padding:6px;border-radius:6px;text-align:center;background:#ffffff10;border:1px solid #ffffff15}
+  .legend{display:flex;gap:8px;align-items:center}
+  .legend span{display:inline-block;width:10px;height:10px;border-radius:2px;background:#ffffff30}
+  @media (max-width:700px){canvas{height:180px}}
+</style>
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="row">
+      <button id="btnStep">Step</button>
+      <button id="btnRun">Run</button>
+      <button id="btnReset">Reset</button>
+      <span class="pill mono">Episode: <span id="ep">0</span></span>
+      <span class="pill mono">Step: <span id="st">0</span></span>
+    </div>
+    <div class="row">
+      <label>Speed <input id="speed" type="range" min="1" max="60" value="30"></label>
+      <label>ε <input id="eps" type="range" min="0" max="100" value="15"></label>
+      <label>α <input id="alpha" type="range" min="1" max="100" value="25"></label>
+      <label>γ <input id="gamma" type="range" min="0" max="99" value="90"></label>
+      <span class="small">ε-greedy exploration, learning rate α, discount γ.</span>
+    </div>
+  </header>
+
+  <section>
+    <div class="grid">
+      <div class="card">
+        <b>Current 2-Qubit State |ψ⟩ (basis |00>,|01>,|10>,|11>)</b>
+        <div class="mono small" id="amps"></div>
+        <div class="bar" title="Concurrence (entanglement measure)">
+          <span id="barC" style="width:0%"></span>
+        </div>
+        <div class="row">
+          <span class="pill">Concurrence: <b id="conc">0.000</b></span>
+          <span class="pill">Reward (last): <b id="rew">0.000</b></span>
+          <span class="pill">Bucket s: <b id="buck">0</b></span>
+        </div>
+      </div>
+
+      <div class="card">
+        <b>Agent A (left qubit) action</b>
+        <div class="row mono" id="actA"></div>
+        <b>Agent B (right qubit) action</b>
+        <div class="row mono" id="actB"></div>
+        <div class="small">If <i>both</i> choose E in the same step ⇒ apply CNOT (A control → B target).</div>
+      </div>
+
+      <div class="card">
+        <b>Probabilities</b>
+        <canvas id="probChart"></canvas>
+        <div class="legend small"><span></span> |00|² &nbsp; <span></span> |01|² &nbsp; <span></span> |10|² &nbsp; <span></span> |11|²</div>
+      </div>
+
+      <div class="card">
+        <b>Q-Tables (state buckets 0…5 × 7 actions)</b>
+        <div class="small">Actions: I, X, Z, H, S, RZ, E</div>
+        <div class="row">
+          <div class="col" style="flex:1">
+            <b>Agent A</b>
+            <div id="qA" class="qtable"></div>
+          </div>
+          <div class="col" style="flex:1">
+            <b>Agent B</b>
+            <div id="qB" class="qtable"></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section>
+    <b>How it works (quick notes)</b>
+    <ul class="small">
+      <li>State = bucketized concurrence (6 buckets). Goal is to drive concurrence ↑.</li>
+      <li>Per step reward = Δconcurrence; terminal bonus = +0.2·C if episode ends.</li>
+      <li>Agents choose simultaneously with ε-greedy. If both pick <b>E</b> ⇒ CNOT.</li>
+      <li>Single-qubit actions (on own qubit): I, X, Z, H, S, RZ(π/4).</li>
+      <li>Environment resets to |00⟩; episode length defaults to 30 steps.</li>
+    </ul>
+  </section>
+
+  <section>
+    <b>Event log</b>
+    <div id="log" class="mono small" style="max-height:200px;overflow:auto;white-space:pre-wrap"></div>
+  </section>
+</div>
+
+<script>
+/* ---------- minimal complex ops ---------- */
+function c(re=0,im=0){return {re,im}}
+function cAdd(a,b){return c(a.re+b.re,a.im+b.im)}
+function cSub(a,b){return c(a.re-b.re,a.im-b.im)}
+function cMul(a,b){return c(a.re*b.re - a.im*b.im, a.re*b.im + a.im*b.re)}
+function cConj(a){return c(a.re,-a.im)}
+function cAbs2(a){return a.re*a.re + a.im*a.im}
+function cScale(a,s){return c(a.re*s,a.im*s)}
+/* matrix ops on small arrays of complex numbers */
+function matMul(A,B,n){ // n x n
+  const out=Array(n*n).fill(0).map(()=>c(0,0));
+  for(let i=0;i<n;i++)for(let k=0;k<n;k++){
+    const aik=A[i*n+k];
+    for(let j=0;j<n;j++){
+      out[i*n+j]=cAdd(out[i*n+j], cMul(aik,B[k*n+j]));
+    }
+  }
+  return out;
+}
+function kron(A, B, nA, nB){ // square dims
+  const n = nA*nB, out = Array(n*n).fill(0).map(()=>c(0,0));
+  for(let i=0;i<nA;i++)for(let j=0;j<nA;j++)
+    for(let k=0;k<nB;k++)for(let l=0;l<nB;l++){
+      const row = i*nB + k, col = j*nB + l;
+      out[row*n+col] = cMul(A[i*nA+j], B[k*nB+l]);
+    }
+  return out;
+}
+function applyU4(U, psi){ // 4x4 on 4 vector
+  const y=[c(),c(),c(),c()];
+  for(let i=0;i<4;i++){
+    let s=c();
+    for(let j=0;j<4;j++) s=cAdd(s, cMul(U[i*4+j], psi[j]));
+    y[i]=s;
+  }
+  return y;
+}
+
+/* ---------- gate library ---------- */
+const I2=[c(1,0),c(),c(),c(1,0)];
+const X =[c(),c(1,0),c(1,0),c()];
+const Z =[c(1,0),c(),c(),c(-1,0)];
+const H = [c(1/Math.SQRT2,0),c(1/Math.SQRT2,0),c(1/Math.SQRT2,0),c(-1/Math.SQRT2,0)];
+const S = [c(1,0),c(),c(),c(0,1)]; // phase
+function RZ(theta){return [c(1,0),c(),c(),c(Math.cos(theta),Math.sin(theta))]}
+
+/* CNOT (A control -> B target) in computational basis */
+const CNOT = [
+  c(1,0),c(),c(),c(),
+  c(),c(1,0),c(),c(),
+  c(),c(),c(),c(1,0),
+  c(),c(),c(1,0),c()
+];
+
+/* ---------- environment & RL ---------- */
+const ACTIONS = ["I","X","Z","H","S","RZ","E"]; // 7 actions per agent
+const S_BUCKETS = 6; // 0..5
+
+function actionUnitary(a,isA){
+  // single-qubit gate for agent's local choice (except E)
+  let g;
+  if(a==="I") g=I2;
+  else if(a==="X") g=X;
+  else if(a==="Z") g=Z;
+  else if(a==="H") g=H;
+  else if(a==="S") g=S;
+  else if(a==="RZ") g=RZ(Math.PI/4);
+  if(!g) return null;
+  return isA ? kron(g,I2,2,2) : kron(I2,g,2,2);
+}
+
+function concurrence(psi){
+  // psi = [a00, a01, a10, a11]
+  const a00=psi[0], a01=psi[1], a10=psi[2], a11=psi[3];
+  const term = cSub( cMul(a00,a11), cMul(a01,a10) );
+  return Math.min(1, Math.max(0, 2*Math.sqrt(cAbs2(term))));
+}
+
+function probs(psi){return psi.map(cAbs2)}
+
+function normalize(psi){
+  let s=0; for(const z of psi) s+=cAbs2(z);
+  s=Math.sqrt(s);
+  return psi.map(z=>c(z.re/s,z.im/s));
+}
+
+class Env {
+  constructor(){
+    this.reset();
+    this.maxSteps = 30;
+  }
+  reset(){
+    this.psi = [c(1,0),c(),c(),c()]; // |00>
+    this.t = 0;
+    this.lastC = concurrence(this.psi);
+    return this.stateBucket();
+  }
+  stateBucket(){
+    const ccur = concurrence(this.psi);
+    return Math.min(S_BUCKETS-1, Math.floor(ccur*(S_BUCKETS))); // 0..5
+  }
+  step(actA, actB){
+    // Apply local unitaries for non-E
+    const UA = actA==="E" ? null : actionUnitary(actA,true);
+    const UB = actB==="E" ? null : actionUnitary(actB,false);
+    let U = null;
+    if(UA && UB) U = matMul(UB, UA, 4);
+    else if(UA) U = UA;
+    else if(UB) U = UB;
+
+    if(U) this.psi = applyU4(U, this.psi);
+
+    // If both chose E this step, apply CNOT (A->B)
+    if(actA==="E" && actB==="E"){
+      this.psi = applyU4(CNOT, this.psi);
+    }
+
+    this.psi = normalize(this.psi);
+    const cNow = concurrence(this.psi);
+    const r = (cNow - this.lastC); // step reward: delta entanglement
+    this.lastC = cNow;
+    this.t++;
+    const done = this.t>=this.maxSteps;
+    const bonus = done ? 0.2*cNow : 0.0;
+    const s1 = this.stateBucket();
+    return {s1, reward: r + bonus, done, cNow};
+  }
+}
+
+class Agent {
+  constructor(name){
+    this.name=name;
+    this.Q = Array(S_BUCKETS).fill(0).map(()=>Array(ACTIONS.length).fill(0));
+  }
+  pickAction(s, eps){
+    if(Math.random()<eps) return Math.floor(Math.random()*ACTIONS.length);
+    const row = this.Q[s];
+    let best=0,bi=0;
+    for(let i=0;i<row.length;i++){ if(i===0 || row[i]>best){best=row[i];bi=i} }
+    return bi;
+  }
+  update(s,a,r,s1,alpha,gamma){
+    const maxNext = Math.max(...this.Q[s1]);
+    this.Q[s][a] = (1-alpha)*this.Q[s][a] + alpha*(r + gamma*maxNext);
+  }
+}
+
+/* ---------- simulation orchestration ---------- */
+const env = new Env();
+const A = new Agent("A"); const B = new Agent("B");
+let s = env.reset();
+let episode=0, stepCt=0;
+let running=false, loopHandle=null;
+
+const el = id=>document.getElementById(id);
+const ep=el('ep'), st=el('st'), amps=el('amps'), conc=el('conc'), rew=el('rew'), buck=el('buck'), log=el('log');
+const qA=el('qA'), qB=el('qB'), barC=el('barC'), actA=el('actA'), actB=el('actB');
+const speed=el('speed'), epsR=el('eps'), alphaR=el('alpha'), gammaR=el('gamma');
+
+function fmtC(z){
+  const re = z.re.toFixed(3), im=z.im.toFixed(3);
+  const sign = z.im>=0?'+':'−';
+  return `${re} ${sign} ${Math.abs(z.im).toFixed(3)}i`;
+}
+function renderAmps(){
+  const p = probs(env.psi).map(x=>x.toFixed(3));
+  const a = env.psi.map(fmtC);
+  amps.innerHTML =
+    `|00⟩: ${a[0]}  (p=${p[0]})<br>`+
+    `|01⟩: ${a[1]}  (p=${p[1]})<br>`+
+    `|10⟩: ${a[2]}  (p=${p[2]})<br>`+
+    `|11⟩: ${a[3]}  (p=${p[3]})`;
+}
+function colorFor(val, min=-0.3, max=0.6){
+  const t = Math.max(0, Math.min(1, (val-min)/(max-min)));
+  const h = 220 - 220*t; // blue -> green
+  return `hsl(${h} 80% 45% / 0.9)`;
+}
+function renderQ(){
+  function fill(table, Q){
+    table.innerHTML='';
+    // header
+    ["I","X","Z","H","S","RZ","E"].forEach(a=>{
+      const h=document.createElement('div');h.className='cell small';h.style.fontWeight='bold';h.textContent=a;table.appendChild(h);
+    });
+    for(let s=0;s<S_BUCKETS;s++){
+      for(let a=0;a<ACTIONS.length;a++){
+        const v=Q[s][a];
+        const d=document.createElement('div'); d.className='cell small';
+        d.style.background=colorFor(v);
+        d.title=`s=${s} a=${ACTIONS[a]} Q=${v.toFixed(3)}`;
+        d.textContent=v.toFixed(2);
+        table.appendChild(d);
+      }
+    }
+  }
+  fill(qA,A.Q); fill(qB,B.Q);
+}
+function logLine(t){ log.textContent += t+"\n"; log.scrollTop = log.scrollHeight; }
+function renderActs(aidx,bidx){
+  actA.textContent = `Chose: ${ACTIONS[aidx]}`;
+  actB.textContent = `Chose: ${ACTIONS[bidx]}`;
+}
+function renderHUD(lastR){
+  st.textContent = String(stepCt);
+  buck.textContent = String(s);
+  const cNow = env.lastC;
+  conc.textContent = cNow.toFixed(3);
+  barC.style.width = (cNow*100).toFixed(1)+'%';
+  rew.textContent = lastR.toFixed(3);
+  renderAmps(); renderQ(); drawProbs();
+}
+
+const canvas = el('probChart'); const ctx = canvas.getContext('2d');
+function resizeCanvas(){
+  const r = canvas.getBoundingClientRect();
+  canvas.width = Math.max(300, Math.floor(r.width));
+  canvas.height = Math.max(140, Math.floor(r.height));
+}
+window.addEventListener('resize', ()=>{resizeCanvas(); drawProbs();});
+resizeCanvas();
+
+function drawProbs(){
+  const P = probs(env.psi);
+  const w = canvas.width, h=canvas.height, pad=20;
+  ctx.clearRect(0,0,w,h);
+  const labels=['|00>','|01>','|10>','|11>'];
+  const barw = (w-2*pad)/4 - 12;
+  for(let i=0;i<4;i++){
+    const x = pad + i*((w-2*pad)/4) + 6;
+    const y = h - pad;
+    const bh = (h-2*pad)*P[i];
+    ctx.fillRect(x, y-bh, barw, bh);
+    ctx.fillText(labels[i], x, y+12);
+    ctx.fillText(P[i].toFixed(2), x, y-bh-6);
+  }
+}
+
+function stepOnce(){
+  const eps = +epsR.value/100, alpha=+alphaR.value/100, gamma=+gammaR.value/100;
+  const aA = A.pickAction(s, eps);
+  const aB = B.pickAction(s, eps);
+  renderActs(aA,aB);
+  const {s1, reward, done, cNow} = env.step(ACTIONS[aA], ACTIONS[aB]);
+  A.update(s, aA, reward, s1, alpha, gamma);
+  B.update(s, aB, reward, s1, alpha, gamma);
+  stepCt++;
+  logLine(`t=${stepCt}: A=${ACTIONS[aA]} B=${ACTIONS[aB]}  C=${cNow.toFixed(3)}  r=${reward.toFixed(3)}`); 
+  renderHUD(reward);
+  s = s1;
+  if(done){
+    episode++; ep.textContent=String(episode);
+    // new episode
+    s = env.reset(); stepCt=0;
+    logLine(`▶ Reset episode ${episode}, state bucket ${s}`);
+    renderHUD(0);
+  }
+}
+
+function runLoop(){
+  if(!running) return;
+  const fps = +speed.value; // steps per second
+  stepOnce();
+  loopHandle = setTimeout(runLoop, 1000/Math.max(1,fps));
+}
+
+el('btnStep').onclick = ()=>stepOnce();
+el('btnRun').onclick = ()=>{
+  running = !running;
+  el('btnRun').textContent = running ? "Pause" : "Run";
+  if(running) runLoop(); else clearTimeout(loopHandle);
+};
+el('btnReset').onclick = ()=>{
+  running=false; el('btnRun').textContent="Run";
+  env.reset(); s=env.stateBucket(); stepCt=0; renderHUD(0); logLine("Manual reset.");
+};
+
+renderHUD(0);
+logLine("Ready. Click Run to watch agents learn to coordinate E (CNOT) and raise concurrence.");
+</script>
+</body>
+</html>
